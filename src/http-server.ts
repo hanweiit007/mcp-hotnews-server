@@ -103,7 +103,7 @@ app.get('/api/sources', handleSources);
 app.get('/mcp-client', handleMcpClient);
 
 // 启动服务器
-const port = process.env.PORT || 3001;
+const port = process.env.PORT || 9000;
 app.listen(port, () => {
   console.log(`MCP 服务运行在 http://localhost:${port}`);
   console.log('可用的端点:');
