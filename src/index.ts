@@ -1,4 +1,14 @@
 #!/usr/bin/env node
+/**
+ * MCP热点新闻服务器
+ * 
+ * 注意：webview-only模式下，以下功能不会被使用：
+ * - get_hot_news: 热点列表获取（小程序使用静态列表）
+ * - get_article_content: 文章内容抓取（小程序直接使用webview）
+ * - get_article_html: HTML代理（小程序直接使用webview）
+ * 
+ * webview-only编译模式可以完全不部署此MCP服务器
+ */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -20,18 +30,11 @@ import {
 } from "./config.js";
 
 // Define interfaces for type safety
-interface HotNewsSource {
-  name: string;
-  description: string;
-}
-
 interface HotNewsItem {
   index: number;
   title: string;
   url: string;
   hot?: string | number;
-  content?: string; // 新增：文章内容
-  summary?: string; // 新增：文章摘要
 }
 
 interface HotNewsResponse {
@@ -43,14 +46,40 @@ interface HotNewsResponse {
   data: HotNewsItem[];
 }
 
+// 简化缓存机制
+class SimpleCache {
+  private cache = new Map<string, { data: any; expires: number }>();
+  
+  set(key: string, data: any, ttlMinutes: number = 5) {
+    this.cache.set(key, {
+      data,
+      expires: Date.now() + ttlMinutes * 60 * 1000
+    });
+  }
+  
+  get(key: string): any | null {
+    const item = this.cache.get(key);
+    if (!item || Date.now() > item.expires) {
+      this.cache.delete(key);
+      return null;
+    }
+    return item.data;
+  }
+  
+  clear() {
+    this.cache.clear();
+  }
+}
+
 class HotNewsServer {
   private server: Server;
+  private cache = new SimpleCache();
 
   constructor() {
     this.server = new Server(
       {
         name: "mcp-server/hotnewslist",
-        version: "0.1.0",
+        version: "0.2.0",
       },
       {
         capabilities: {
@@ -68,7 +97,7 @@ class HotNewsServer {
       tools: [
         {
           name: "get_hot_news",
-          description: "Get hot trending lists from various platforms",
+          description: "Get hot trending lists from various platforms. 【webview-only模式不使用】",
           inputSchema: {
             type: "object",
             properties: {
@@ -85,10 +114,9 @@ class HotNewsServer {
             required: ["sources"],
           },
         },
-        // 新增：获取文章内容的工具
         {
           name: "get_article_content",
-          description: "Get article content for rich-text display",
+          description: "Get article content for rich-text display. 【webview-only模式不使用】",
           inputSchema: {
             type: "object",
             properties: {
@@ -100,10 +128,9 @@ class HotNewsServer {
             required: ["url"],
           },
         },
-        // 新增：获取文章HTML页面的工具（用于webview代理）
         {
           name: "get_article_html",
-          description: "Get full HTML page for webview display with proxy support",
+          description: "Get full HTML page for webview display with proxy support. 【webview-only模式不使用】",
           inputSchema: {
             type: "object",
             properties: {
@@ -141,57 +168,38 @@ class HotNewsServer {
         throw new Error("Please provide valid source IDs");
       }
 
-      // Fetch multiple hot lists
-      const results = await Promise.all(
-        sources.map(async (sourceId) => {
-          const source = HOT_NEWS_SOURCES[sourceId];
-          if (!source) {
-            return `Source ID ${sourceId} does not exist`;
-          }
+      const results = await this.getHotNews(sources);
+      
+      // 格式化输出为MCP协议要求的格式
+      const formattedResults = results.map((result: any) => {
+        if (typeof result === 'string') {
+          return result; // 错误信息直接返回
+        }
+        
+        const newsList = result.data.map(
+          (item: HotNewsItem) =>
+            `${item.index}. [${item.title}](${item.url}) ${
+              item.hot ? `<small>Heat: ${item.hot}</small>` : ""
+            }`,
+        );
 
-          try {
-            const response = await axios.get<HotNewsResponse>(
-              `${BASE_API_URL}/${source.name}`,
-            );
-            const news = response.data;
-
-            if (!news.success) {
-              return `Failed to fetch ${source.description}: ${news.message}`;
-            }
-
-            const newsList = news.data.map(
-              (item: HotNewsItem) =>
-                `${item.index}. [${item.title}](${item.url}) ${
-                  item.hot ? `<small>Heat: ${item.hot}</small>` : ""
-                }`,
-            );
-
-            return `
-### ${news.name}:${news.subtitle}
-> Last updated: ${news.update_time}
+        return `
+### ${result.name}:${result.subtitle}
+> Last updated: ${result.update_time}
 ${newsList.join("\n")}
 `;
-          } catch (error) {
-            return `Failed to fetch ${source.description}: ${
-              axios.isAxiosError(error)
-                ? (error.response?.data.message ?? error.message)
-                : "Unknown error"
-            }`;
-          }
-        }),
-      );
+      });
 
       return {
         content: [
           {
             type: "text",
-            text: results.join("\n\n"),
+            text: formattedResults.join("\n\n"),
           },
         ],
       };
     } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : "Unknown error";
+      const errorMessage = error instanceof Error ? error.message : "Unknown error";
       return {
         content: [
           {
@@ -575,41 +583,150 @@ ${newsList.join("\n")}
     return 'general';
   }
 
-  async getHotNews(sources: number[]) {
-    const results = await Promise.all(
-      sources.map(async (sourceId) => {
-        const source = HOT_NEWS_SOURCES[sourceId];
-        if (!source) {
-          return `Source ID ${sourceId} does not exist`;
+  // 并行请求的核心方法
+  async getHotNews(sources: number[], timeoutSeconds: number = 8) {
+    // 检查缓存
+    const cacheKey = `hotnews_${sources.join('_')}`;
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      console.log('返回缓存数据:', cacheKey);
+      return cached;
+    }
+
+    console.log(`开始并行获取${sources.length}个站点数据，超时设置: ${timeoutSeconds}秒`);
+    
+    // 创建所有请求的Promise数组
+    const requestPromises = sources.map(sourceId => this.fetchSingleSource(sourceId));
+    
+    try {
+      // 使用Promise.allSettled + 超时控制
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('TIMEOUT')), timeoutSeconds * 1000);
+      });
+      
+      // 竞速：要么所有请求完成，要么超时
+      const raceResult = await Promise.race([
+        Promise.allSettled(requestPromises),
+        timeoutPromise
+      ]);
+      
+      // 处理结果
+      const results = [];
+      for (let i = 0; i < sources.length; i++) {
+        const result = (raceResult as PromiseSettledResult<any>[])[i];
+        
+        if (result && result.status === 'fulfilled') {
+          results.push(result.value);
+        } else {
+          // 失败或未完成的请求，使用降级数据
+          console.warn(`站点${sources[i]}请求失败或超时，使用降级数据`);
+          results.push(this.getFallbackSiteData(sources[i]));
         }
-
-        try {
-          const response = await axios.get<HotNewsResponse>(
-            `${BASE_API_URL}/${source.name}`,
-          );
-          const news = response.data;
-
-          if (!news.success) {
-            return `Failed to fetch ${source.description}: ${news.message}`;
+      }
+      
+      // 缓存成功结果
+      this.cache.set(cacheKey, results, 5);
+      console.log(`成功获取${results.length}个站点数据`);
+      
+      return results;
+      
+    } catch (error) {
+      if (error instanceof Error && error.message === 'TIMEOUT') {
+        console.log(`请求超时(${timeoutSeconds}秒)，返回部分完成的结果...`);
+        
+        // 超时处理：使用 Promise.allSettled 获取已完成的结果
+        const partialResults = await Promise.allSettled(requestPromises);
+        const finalResults = [];
+        
+        for (let i = 0; i < sources.length; i++) {
+          const result = partialResults[i];
+          if (result.status === 'fulfilled') {
+            finalResults.push(result.value);
+          } else {
+            // 未完成或失败的请求使用降级数据
+            console.warn(`站点${sources[i]}超时或失败，使用降级数据`);
+            finalResults.push(this.getFallbackSiteData(sources[i]));
           }
-
-          return {
-            name: news.name,
-            subtitle: news.subtitle,
-            update_time: news.update_time,
-            data: news.data
-          };
-        } catch (error) {
-          return `Failed to fetch ${source.description}: ${
-            axios.isAxiosError(error)
-              ? (error.response?.data.message ?? error.message)
-              : "Unknown error"
-          }`;
         }
-      }),
-    );
+        
+        // 缓存部分结果，TTL设置为更短时间
+        this.cache.set(cacheKey, finalResults, 2);
+        console.log(`超时处理完成，返回${finalResults.length}个结果（包含${finalResults.filter(r => r?.data?.[0]?.title !== '数据加载中，请稍候...').length}个有效结果）`);
+        return finalResults;
+      }
+      
+      // 其他错误，全部使用降级数据
+      console.error('获取热点数据失败:', error);
+      const fallbackResults = sources.map(sourceId => this.getFallbackSiteData(sourceId));
+      return fallbackResults;
+    }
+  }
 
-    return results;
+  // 单个数据源的请求方法
+  private async fetchSingleSource(sourceId: number): Promise<any> {
+    const source = HOT_NEWS_SOURCES[sourceId];
+    if (!source) {
+      throw new Error(`Source ID ${sourceId} does not exist`);
+    }
+
+    try {
+      const response = await axios.get<HotNewsResponse>(
+        `${BASE_API_URL}/${source.name}`,
+        {
+          timeout: 6000, // 单个请求6秒超时
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Cache-Control': 'no-cache'
+          }
+        }
+      );
+      
+      const news = response.data;
+      if (!news.success) {
+        throw new Error(`API returned error: ${news.message}`);
+      }
+
+      return {
+        name: news.name,
+        subtitle: news.subtitle,
+        update_time: news.update_time,
+        data: news.data
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      console.error(`获取${source.description}失败: ${message}`);
+      throw error;
+    }
+  }
+
+  // 降级数据生成
+  private getFallbackSiteData(sourceId: number) {
+    const source = HOT_NEWS_SOURCES[sourceId];
+    if (!source) return null;
+    
+    const siteName = source.description.split('(')[1]?.replace(')', '') || source.description;
+    
+    return {
+      name: siteName,
+      subtitle: '热榜',
+      update_time: new Date().toLocaleString('zh-CN'),
+      data: [
+        {
+          index: 1,
+          title: '数据加载中，请稍候...',
+          url: '#',
+          hot: 0
+        },
+        {
+          index: 2, 
+          title: '网络连接缓慢，正在重试',
+          url: '#',
+          hot: 0
+        }
+      ]
+    };
   }
 
   // 新增：获取文章内容的公共方法
@@ -813,6 +930,12 @@ ${newsList.join("\n")}
       </body>
       </html>
     `;
+  }
+
+  // 清理缓存的公共方法
+  clearCache() {
+    this.cache.clear();
+    console.log('缓存已清理');
   }
 
   async run() {

@@ -1,3 +1,17 @@
+/**
+ * MCP热点新闻HTTP服务器
+ * 
+ * 提供HTTP API接口，供小程序调用
+ * 
+ * 注意：webview-only模式下，以下端点不会被使用：
+ * - POST /api/hotnews - 热点列表获取（小程序使用静态列表）
+ * - POST /api/article-content - 文章内容抓取（小程序直接使用webview）
+ * - POST /api/article-html - HTML代理（小程序直接使用webview）
+ * - GET /api/article-html - HTML代理GET方式（小程序直接使用webview）
+ * 
+ * webview-only编译模式可以完全不部署此HTTP服务器
+ */
+
 import express, { Request, Response, RequestHandler } from 'express';
 import cors from 'cors';
 import { HotNewsServer } from './index.js';
@@ -33,8 +47,11 @@ const handleHotNews: RequestHandler = async (req, res) => {
       }
     }
 
+    // 获取超时参数，默认8秒
+    const timeout = typeof req.body.timeout === 'number' ? req.body.timeout : 8;
+    
     // 调用 MCP 服务的 get_hot_news 方法
-    const result = await server.getHotNews(siteIds);
+    const result = await server.getHotNews(siteIds, timeout);
     res.json(result);
   } catch (error) {
     console.error('处理请求时出错:', error);
@@ -47,7 +64,7 @@ const handleHotNews: RequestHandler = async (req, res) => {
 // 新增：处理文章HTML代理请求（GET方式，用于webview）
 const handleArticleHtmlGet: RequestHandler = async (req, res) => {
   try {
-    const { url } = req.query;
+    const { url, mode } = req.query;
     
     if (!url || typeof url !== 'string') {
       console.error('无效的URL参数:', url);
@@ -61,7 +78,24 @@ const handleArticleHtmlGet: RequestHandler = async (req, res) => {
       return;
     }
 
-    console.log('开始GET代理HTML页面:', url);
+    // 检查显示模式，只有proxy-webview模式才进行HTML代理
+    if (mode && mode !== 'proxy-webview') {
+      console.log(`跳过HTML代理，当前模式: ${mode}`);
+      res.status(400).send(`
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="utf-8"><title>模式限制</title></head>
+        <body>
+          <h1>访问受限</h1>
+          <p>仅proxy-webview模式支持HTML代理</p>
+          <p>当前模式: ${mode}</p>
+        </body>
+        </html>
+      `);
+      return;
+    }
+
+    console.log('开始GET代理HTML页面:', url, '模式:', mode || 'proxy-webview');
     
     // 调用 MCP 服务的 getArticleHtml 方法
     const htmlContent = await server.getArticleHtml(url);
@@ -134,7 +168,7 @@ const handleArticleHtml: RequestHandler = async (req, res) => {
   try {
     console.log('接收到HTML代理请求:', req.body);
     
-    const { url } = req.body;
+    const { url, mode } = req.body;
     
     if (!url || typeof url !== 'string') {
       console.error('无效的URL参数:', url);
@@ -142,7 +176,17 @@ const handleArticleHtml: RequestHandler = async (req, res) => {
       return;
     }
 
-    console.log('开始获取HTML页面:', url);
+    // 检查显示模式，只有proxy-webview模式才进行HTML代理
+    if (mode !== 'proxy-webview') {
+      console.log(`跳过HTML代理，当前模式: ${mode}`);
+      res.status(400).json({ 
+        error: '仅proxy-webview模式支持HTML代理',
+        mode: mode 
+      });
+      return;
+    }
+
+    console.log('开始获取HTML页面:', url, '模式:', mode);
     
     // 调用 MCP 服务的 getArticleHtml 方法
     const htmlContent = await server.getArticleHtml(url);
@@ -197,7 +241,7 @@ const handleArticleContent: RequestHandler = async (req, res) => {
   try {
     console.log('接收到文章内容请求:', req.body);
     
-    const { url } = req.body;
+    const { url, mode } = req.body;
     
     if (!url || typeof url !== 'string') {
       console.error('无效的URL参数:', url);
@@ -205,7 +249,17 @@ const handleArticleContent: RequestHandler = async (req, res) => {
       return;
     }
 
-    console.log('开始获取文章内容:', url);
+    // 检查显示模式，只有rich-text模式才进行内容抓取
+    if (mode !== 'rich-text') {
+      console.log(`跳过内容抓取，当前模式: ${mode}`);
+      res.status(400).json({ 
+        error: '仅rich-text模式支持内容抓取',
+        mode: mode 
+      });
+      return;
+    }
+
+    console.log('开始获取文章内容:', url, '模式:', mode);
     
     // 调用 MCP 服务的 getArticleContent 方法
     const result = await server.getArticleContent(url);
@@ -270,6 +324,8 @@ const handleMcpClient: RequestHandler = (req, res) => {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+                  'Accept': 'application/json'
                 },
                 body: JSON.stringify({ sources }),
               });
@@ -292,6 +348,8 @@ const handleMcpClient: RequestHandler = (req, res) => {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+                  'Accept': 'application/json'
                 },
                 body: JSON.stringify({ url }),
               });
@@ -317,6 +375,22 @@ const handleMcpClient: RequestHandler = (req, res) => {
   `);
 };
 
+// 健康检查端点
+const handleHealth: RequestHandler = (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage()
+  });
+};
+
+// 清理缓存端点（调试用）
+const handleClearCache: RequestHandler = (req, res) => {
+  server.clearCache();
+  res.json({ message: '缓存已清理', timestamp: new Date().toISOString() });
+};
+
 // 注册路由
 app.post('/api/hotnews', handleHotNews);
 app.post('/api/article-content', handleArticleContent); // 文章内容（rich-text）
@@ -324,16 +398,26 @@ app.post('/api/article-html', handleArticleHtml); // HTML代理（webview POST�
 app.get('/api/article-html', handleArticleHtmlGet); // 新增：HTML代理（webview GET）
 app.get('/api/sources', handleSources);
 app.get('/mcp-client', handleMcpClient);
+app.get('/health', handleHealth); // 健康检查
+app.post('/admin/clear-cache', handleClearCache); // 清理缓存（管理用）
 
 // 启动服务器
 const port = process.env.PORT || 9000;
 app.listen(port, () => {
   console.log(`MCP 服务运行在 http://localhost:${port}`);
   console.log('可用的端点:');
-  console.log('- POST /api/hotnews - 获取热点新闻');
+  console.log('- POST /api/hotnews - 获取热点新闻（并行请求+超时控制+缓存优化）');
   console.log('- POST /api/article-content - 获取文章内容（rich-text模式）');
   console.log('- POST /api/article-html - 获取文章HTML页面（webview代理模式）');
-  console.log('- GET /api/article-html - 获取文章HTML页面（webview GET代理模式）'); // 新增说明
+  console.log('- GET /api/article-html - 获取文章HTML页面（webview GET代理模式）');
   console.log('- GET /api/sources - 获取所有可用的站点列表');
   console.log('- GET /mcp-client - MCP 客户端注入页面');
-}); 
+  console.log('- GET /health - 健康检查');
+  console.log('- POST /admin/clear-cache - 清理缓存（管理用）');
+  console.log('');
+  console.log('优化特性:');
+  console.log('- 并行请求: 9个站点同时请求，提升响应速度');
+  console.log('- 超时控制: 默认8秒超时，返回已完成的数据');
+  console.log('- 智能缓存: 5分钟TTL，减少API调用频率');
+  console.log('- 降级处理: 请求失败时提供占位内容');
+});
